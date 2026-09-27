@@ -3,7 +3,10 @@ CFLAGS  ?= -O3 -march=native -mamx-tile -mamx-int8 -mamx-bf16 -fopenmp -ffp-cont
 LDLIBS  = -lm
 CORE    = gemm.o amx.o bitlinear.o block.o model.o stream.o
 
-all: train infer test
+all: train infer test dilated_walshnet
+
+dilated_walshnet: dilated_walshnet.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
 
 %.o: %.c wn.h
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -19,6 +22,6 @@ check: test
 	./test
 
 clean:
-	rm -f *.o train infer test
+	rm -f *.o train infer test dilated_walshnet
 
 .PHONY: all check clean

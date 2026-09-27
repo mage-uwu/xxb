@@ -10,6 +10,20 @@ block(x) = BitLinear_out( conv_K(u) ⊙ g ),   [u | g] = BitLinear_in(x),   x �
 - **conv_K:** depthwise K-tap convolution. It's **causal** (taps t, t−1, …) for language modelling and **centred** for masked LM.
 - **No attention, no FFN, no long convolution.** The ablations in `../research` found this simplest stack gave the best quality per parameter on our benchmark (see below).
 
+## Standalone reference: `dilated_walshnet.c`
+
+Everything below (training, inference, streaming, masked infill, benchmarks and the full self-test) is also in **one self-contained C file**, generated from these sources. It trains byte-identical checkpoints:
+
+```sh
+gcc -O3 -march=native -mamx-tile -mamx-int8 -mamx-bf16 -fopenmp dilated_walshnet.c -lm -o dilated_walshnet
+./dilated_walshnet test
+./dilated_walshnet train --data input.txt --dilate 3 --out model.bin            # causal
+./dilated_walshnet train --data input.txt --mode bidir --dilate 3 --out mlm.bin # bidirectional (masked LM)
+./dilated_walshnet generate --model model.bin --prompt "ROMEO:"
+./dilated_walshnet fill --model mlm.bin --text "Wh_t is th_ m_tter"
+./dilated_walshnet bench --model model.bin
+```
+
 ## Why it's fast on a CPU
 
 | | How |
@@ -43,6 +57,8 @@ make                 # gcc/clang with AVX-512 (+ AMX optional; auto-detected at 
 | `--layers` | 7 |
 | `--T` | 64 |
 | `--K` | 3 (conv taps) |
+| `--dilate` | 0 (off); with c, layer l's taps are spaced 2^(l mod c) apart |
+| `--save-best` | off; keeps the best-validation checkpoint |
 | `--batch` | 16 |
 | `--steps` | 3000 |
 | `--lr` | 3e-2 |
