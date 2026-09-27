@@ -2,6 +2,8 @@
 
 These are the prototypes and benchmarks behind `walshnet/`.
 
+- **`walshnet_v1/`:** the earlier multi-architecture C runtime. It covers the Walsh long-conv mixer (causal divide-and-conquer and bidirectional FWHT), ternary MLP, light DDLGN (with a bit-sliced inference engine) and CLOPEN FFNs. It reproduces the ablations below.
+
 - **`bench.py`:** NumPy BitNet LM with manual backward passes. It covers:
   - mixers: attention, Walsh long conv, Toeplitz long conv, or short conv only;
   - FFNs: ternary MLP, light DDLGN, or none.
@@ -45,7 +47,7 @@ These are the prototypes and benchmarks behind `walshnet/`.
   - `PointClopen` is block-diagonal over groups and `TemporalClopen` is depthwise, so channel groups never mix before the head.
 - **Circular padding** in `TemporalClopen` wraps the sequence end onto its start, and is non-causal.
 
-**As an LM FFN** (`walshnet --ffn clopen`), with random fan-in wiring and a clipped STE, CLOPEN-3 matches DDLGN at an equal gate count:
+**As an LM FFN** (`walshnet_v1 --ffn clopen`), with random fan-in wiring and a clipped STE, CLOPEN-3 matches DDLGN at an equal gate count:
 
 | FFN | causal val loss | masked-LM val loss |
 |---|---|---|

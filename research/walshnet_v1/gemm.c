@@ -23,6 +23,22 @@ void param_init(Param *p, size_t n, float lr_mul) {
     p->w = xmalloc(4 * n); p->g = xmalloc(4 * n); p->m = xmalloc(4 * n); p->v = xmalloc(4 * n);
 }
 
+static inline void tr16(__m512 r[16]) {                  // in-register 16x16 transpose (4 permute stages)
+    static const int lo8[16] = {0,1,2,3,4,5,6,7,16,17,18,19,20,21,22,23}, hi8[16] = {8,9,10,11,12,13,14,15,24,25,26,27,28,29,30,31};
+    static const int lo4[16] = {0,1,2,3,16,17,18,19,8,9,10,11,24,25,26,27}, hi4[16] = {4,5,6,7,20,21,22,23,12,13,14,15,28,29,30,31};
+    static const int lo2[16] = {0,1,16,17,4,5,20,21,8,9,24,25,12,13,28,29}, hi2[16] = {2,3,18,19,6,7,22,23,10,11,26,27,14,15,30,31};
+    static const int lo1[16] = {0,16,2,18,4,20,6,22,8,24,10,26,12,28,14,30}, hi1[16] = {1,17,3,19,5,21,7,23,9,25,11,27,13,29,15,31};
+    const int *los[4] = {lo8, lo4, lo2, lo1}, *his[4] = {hi8, hi4, hi2, hi1};
+    for (int st = 0, b = 8; st < 4; st++, b >>= 1) {
+        const __m512i il = _mm512_loadu_si512(los[st]), ih = _mm512_loadu_si512(his[st]);
+        __m512 t[16];
+        for (int i = 0; i < 16; i++) t[i] = r[i];
+        for (int i = 0; i < 16; i++) if (!(i & b)) {
+            r[i] = _mm512_permutex2var_ps(t[i], il, t[i + b]); r[i + b] = _mm512_permutex2var_ps(t[i], ih, t[i + b]);
+        }
+    }
+}
+
 void transpose(const float *src, int rows, int cols, float *dst) {
     const int R16 = rows / 16 * 16, C16 = cols / 16 * 16;
     #pragma omp parallel for schedule(static) if ((size_t)rows * cols > 65536)
@@ -98,94 +114,10 @@ void sgemm(int M, int N, int K, const float *A, int lda, const float *B, int ldb
 
 // A^T B: one fast AVX-512 transpose into a reusable scratch buffer, then the NN kernel (not reentrant)
 void sgemm_tn(int M, int N, int K, const float *A, int lda, const float *B, int ldb, float *C, int ldc, int accumulate) {
-    static __thread float *buf = NULL; static __thread size_t cap = 0;   // per-thread (replicas run concurrently)
+    static float *buf = NULL; static size_t cap = 0;
     const size_t need = (size_t)M * K;
     if (need > cap) { free(buf); cap = need; buf = xmalloc(4 * cap); }
     if (lda != M) { fprintf(stderr, "sgemm_tn: lda must equal M\n"); exit(1); }
     transpose(A, K, M, buf);
     gemm_core(M, N, K, buf, K, B, ldb, C, ldc, accumulate);
-}
-
-/* ---------------- bf16 GEMM ---------------- */
-void to_bf16(const float *src, bf16 *dst, size_t n) {
-    #pragma omp parallel for schedule(static) if (n > 65536)
-    for (size_t i = 0; i < n; i += 16) {
-        if (i + 16 <= n) _mm256_storeu_si256((__m256i *)(dst + i), (__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(src + i)));
-        else for (size_t j = i; j < n; j++) { __m512 v = _mm512_set1_ps(src[j]); __m256i b = (__m256i)_mm512_cvtneps_pbh(v); dst[j] = (bf16)_mm256_extract_epi16(b, 0); }
-    }
-}
-
-void pack_pairs_bf16(const float *B, int K, int N, int ldb, const float *rowscale, bf16 *dst) {
-    static const short il[32] = {0,16,1,17,2,18,3,19,4,20,5,21,6,22,7,23,8,24,9,25,10,26,11,27,12,28,13,29,14,30,15,31};
-    const __m512i idx = _mm512_loadu_si512(il);
-    #pragma omp parallel for schedule(static) if ((size_t)K * N > 65536)
-    for (int kp = 0; kp < K / 2; kp++) {
-        const float *r0 = B + (size_t)(2 * kp) * ldb, *r1 = r0 + ldb;
-        const __m512 s0 = _mm512_set1_ps(rowscale ? rowscale[2 * kp] : 1.0f), s1 = _mm512_set1_ps(rowscale ? rowscale[2 * kp + 1] : 1.0f);
-        bf16 *o = dst + (size_t)kp * N * 2;
-        int n = 0;
-        for (; n + 16 <= N; n += 16) {
-            const __m256i a = (__m256i)_mm512_cvtneps_pbh(_mm512_mul_ps(_mm512_loadu_ps(r0 + n), s0));
-            const __m256i b = (__m256i)_mm512_cvtneps_pbh(_mm512_mul_ps(_mm512_loadu_ps(r1 + n), s1));
-            _mm512_storeu_si512(o + 2 * n, _mm512_permutexvar_epi16(idx, _mm512_inserti64x4(_mm512_castsi256_si512(a), b, 1)));
-        }
-        for (; n < N; n++) {
-            float t[2] = {r0[n] * (rowscale ? rowscale[2 * kp] : 1.0f), r1[n] * (rowscale ? rowscale[2 * kp + 1] : 1.0f)};
-            bf16 bb[2]; to_bf16(t, bb, 2); o[2 * n] = bb[0]; o[2 * n + 1] = bb[1];
-        }
-    }
-}
-
-static inline __attribute__((always_inline)) void kern_bf16(int mr, int nr, int K, const bf16 *A, int lda, const bf16 *Bp,
-                                                            float *C, int ldc, float alpha, int accumulate) {
-    __m512 c0[8], c1[8];
-    const __mmask16 m0 = nr >= 16 ? 0xFFFF : (__mmask16)((1u << nr) - 1);
-    const __mmask16 m1 = nr >= 32 ? 0xFFFF : nr > 16 ? (__mmask16)((1u << (nr - 16)) - 1) : 0;
-    for (int r = 0; r < 8; r++) { c0[r] = _mm512_setzero_ps(); c1[r] = _mm512_setzero_ps(); }
-    for (int kp = 0; kp < K / 2; kp++) {
-        const __m512bh b0 = (__m512bh)_mm512_load_si512(Bp + kp * 64), b1 = (__m512bh)_mm512_load_si512(Bp + kp * 64 + 32);
-        for (int r = 0; r < mr; r++) {
-            const __m512bh a = (__m512bh)_mm512_set1_epi32(*(const int32_t *)(A + (size_t)r * lda + 2 * kp));
-            c0[r] = _mm512_dpbf16_ps(c0[r], a, b0); c1[r] = _mm512_dpbf16_ps(c1[r], a, b1);
-        }
-    }
-    const __m512 al = _mm512_set1_ps(alpha);
-    for (int r = 0; r < mr; r++) {
-        float *c = C + (size_t)r * ldc;
-        __m512 v0 = _mm512_mul_ps(c0[r], al), v1 = _mm512_mul_ps(c1[r], al);
-        if (accumulate) { v0 = _mm512_add_ps(v0, _mm512_maskz_loadu_ps(m0, c)); v1 = _mm512_add_ps(v1, _mm512_maskz_loadu_ps(m1, c + 16)); }
-        _mm512_mask_storeu_ps(c, m0, v0); _mm512_mask_storeu_ps(c + 16, m1, v1);
-    }
-}
-
-// Tasks = (group of IG row-blocks) x (32-col block); each packs its B strip [KC/2][32][2] contiguously once per K chunk.
-void gemm_bf16(int M, int N, int K, const bf16 *A, int lda, const bf16 *Bp, float *C, int ldc, float alpha, int accumulate) {
-    if (g_amx && M % 32 == 0 && N % 32 == 0 && K % 32 == 0) { amx_gemm_bf16(M, N, K, A, lda, Bp, C, ldc, alpha, accumulate); return; }
-    enum { KC = 512, IG = 8 };
-    const int mb = (M + 7) / 8, nb = (N + 31) / 32, ng = (mb + IG - 1) / IG;
-    #pragma omp parallel if ((double)M * N * K > 2e5)
-    {
-        bf16 Bs[(KC / 2) * 64] __attribute__((aligned(64)));
-        #pragma omp for collapse(2) schedule(static)
-        for (int gi = 0; gi < ng; gi++)
-            for (int jb = 0; jb < nb; jb++) {
-                const int j = jb * 32, nr = N - j < 32 ? N - j : 32;
-                const __mmask32 mk = nr >= 16 ? 0xFFFFFFFFu : (__mmask32)((1ull << (2 * nr)) - 1);
-                const __mmask32 mk1 = nr >= 32 ? 0xFFFFFFFFu : nr > 16 ? (__mmask32)((1ull << (2 * (nr - 16))) - 1) : 0;
-                for (int k0 = 0; k0 < K; k0 += KC) {
-                    const int kc = K - k0 < KC ? K - k0 : KC, acc = accumulate || k0 > 0;
-                    for (int kp = 0; kp < kc / 2; kp++) {
-                        const bf16 *src = Bp + ((size_t)(k0 / 2 + kp) * N + j) * 2;
-                        _mm512_store_si512(Bs + kp * 64, _mm512_maskz_loadu_epi16(mk, src));
-                        _mm512_store_si512(Bs + kp * 64 + 32, _mm512_maskz_loadu_epi16(mk1, src + 32));
-                    }
-                    for (int ib = gi * IG; ib < mb && ib < (gi + 1) * IG; ib++) {
-                        const int i = ib * 8, mr = M - i < 8 ? M - i : 8;
-                        const bf16 *a = A + (size_t)i * lda + k0; float *c = C + (size_t)i * ldc + j;
-                        if (mr == 8) kern_bf16(8, nr, kc, a, lda, Bs, c, ldc, alpha, acc);
-                        else         kern_bf16(mr, nr, kc, a, lda, Bs, c, ldc, alpha, acc);
-                    }
-                }
-            }
-    }
 }

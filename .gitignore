@@ -6,3 +6,6 @@ walshnet/test
 __pycache__/
 *.jsonl
 shakespeare.txt
+research/walshnet_v1/train
+research/walshnet_v1/infer
+research/walshnet_v1/test

@@ -1,107 +1,94 @@
 # walshnet
 
-Pure C (C11 + AVX-512 + OpenMP, no dependencies) pretraining and inference for **Walsh-mixer BitNet** language models:
+A deep stack of **gated short-conv BitNet blocks**, pretrained and served in pure C: C11, AVX-512, AMX and OpenMP, with no dependencies.
 
-- **Token mixer:** Hyena-style block with a **Walsh–Hadamard (dyadic) long convolution**: `[u|g] = BitLinear(x)`, then a causal 3-tap depthwise conv on `u`, then `v[t] = Σ h[t⊕s]·u[s]`, then `BitLinear(v ⊙ g)`.
-  - **causal** (`s ≤ t`, for language modelling): O(T log²T) divide and conquer. Each half-split is one full dyadic conv, done with FWHTs.
-  - **bidirectional** (masked LM, BERT-style): exactly `WHT⁻¹(WHT(h) ⊙ WHT(u))`, O(T log T), additions only in the transforms.
-- **FFN**, one of:
-  - **ternary MLP:** BitNet b1.58, ReLU².
-  - **light DDLGN:** differentiable logic-gate network. 4 truth-table logits per 2-input gate, fixed random wiring, residual (pass-through) init, thermometer-encoded inputs, GroupSum readout.
-  - **CLOPEN:** ternary threshold gates over ±1 states, `sign(Σ q3(w)·x − θ)`, with fan-in G, fixed random wiring, pass-through init, thermometer sign inputs and a clipped straight-through estimator. The training forward pass *is* the inference function, with no relaxation.
-- **BitLinear** (BitNet b1.58): per-token RMSNorm, then int8 absmax activations × ternary absmean weights. The forward pass is the *exact* int8 × ternary product on AVX-512 VNNI (`vpdpbusd`). Training uses the straight-through estimator with fp32 backward GEMMs.
-
-## Build and test
-
-```sh
-make            # train, infer, test   (needs gcc/clang with AVX-512 VNNI + OpenMP)
-./test          # kernels vs scalar refs, finite-difference gradients (4 model variants), causality
+```
+block(x) = BitLinear_out( conv_K(u) ⊙ g ),   [u | g] = BitLinear_in(x),   x ← x + block(x)
 ```
 
-## Train
+- **BitLinear** (BitNet b1.58): per-token RMSNorm, then int8 absmax activations × ternary {−1, 0, +1} absmean weights. Training uses the straight-through estimator.
+- **conv_K:** depthwise K-tap convolution. It's **causal** (taps t, t−1, …) for language modelling and **centred** for masked LM.
+- **No attention, no FFN, no long convolution.** The ablations in `../research` found this simplest stack gave the best quality per parameter on our benchmark (see below).
+
+## Why it's fast on a CPU
+
+| | How |
+|---|---|
+| **Forward** | int8 × ternary on **AMX tiles** (`tdpbusd`, about 2 TMAC/s per core), with a VNNI fallback. Bit-exact against an fp32 reference. |
+| **Backward** | Both GEMMs run on **AMX bf16 tiles** (`tdpbf16ps`). Ternary weights and int8 activation codes are exact in bf16; only the gradients are rounded (relative error 1.7e-3 vs fp32). |
+| **Training parallelism** | **Data-parallel replicas:** each core takes its slice of the batch through the whole network with no inner barriers. The weights and packed ternary forms are shared, and gradients are reduced once per step. |
+| **Glue kernels** | In-register 16×16 transposes, fused bf16 packing, and a per-sequence fused conv/gate backward. |
+| **Decoding** | **Constant-state streaming:** each layer keeps only the last K−1 conv inputs, so each new token costs O(layers · d²) regardless of stream length. There's no KV cache and no window recompute. It's verified to match the batch forward bit for bit. |
+
+## Build, test, run
 
 ```sh
-./train --data input.txt --mode causal --ffn mlp   --out causal_mlp.bin
-./train --data input.txt --mode causal --ffn ddlgn --out causal_ddlgn.bin
-./train --data input.txt --mode bidir  --ffn mlp   --out bidir_mlp.bin      # masked LM, 15% masking (80/10/10)
-./train --data input.txt --mode bidir  --ffn ddlgn --out bidir_ddlgn.bin
-./train --data input.txt --mode causal --ffn clopen --cl-lrmul 3 --out causal_clopen.bin
+make                 # gcc/clang with AVX-512 (+ AMX optional; auto-detected at runtime, WN_NO_AMX=1 disables)
+./test               # gemm/BitLinear/AMX/bf16 vs references, finite-difference grads, receptive field,
+                     # streaming == batch, data-parallel == single-model gradients
+./train --data input.txt --out model.bin                        # causal LM, 7 layers, d=64
+./train --data input.txt --mode bidir --out mlm.bin             # masked LM (centred conv, 15% masking)
+./train --data input.txt --d 128 --layers 12 --batch 32 --steps 8000 --lr 2e-2 --out big.bin
+./infer bench    --model model.bin
+./infer generate --model model.bin --prompt "ROMEO:" --n 400 --temp 0.7
+./infer fill     --model mlm.bin   --text "Wh_t is th_ m_tter, my g_od lord?"
 ```
 
-Options:
+`train` options:
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--d` | 64 | model width (multiple of 16) |
-| `--layers` | 2 | number of blocks |
-| `--T` | 64 | sequence length (power of 2) |
-| `--hidden` | 4d | MLP hidden size |
-| `--batch` | 16 | sequences per step |
-| `--steps` | 3000 | training steps |
-| `--lr` | 3e-2 | Adam learning rate (linear warmup, then linear decay) |
-| `--dl-width` | 2048 | gates per DDLGN layer |
-| `--dl-depth` | 4 | DDLGN layers |
-| `--dl-nth` | 8 | thermometer thresholds per input channel |
-| `--dl-temp` | 0.5 | thermometer sigmoid temperature |
-| `--dl-z` | 1 | residual-init strength (truth-table logits start at ±z) |
-| `--dl-lrmul` | 10 | gate learning-rate multiplier |
-| `--cl-width` / `--cl-depth` / `--cl-fanin` | 2048 / 4 / 3 | CLOPEN gates per layer, layers, and inputs per gate |
-| `--cl-nth` / `--cl-temp` | 8 / 0.5 | CLOPEN thermometer thresholds and STE window scale |
-| `--cl-ste` | clip | `clip` passes gradients only when \|pre-activation\| ≤ 1; `id` always passes them |
-| `--cl-lrmul` | 1 (3 works best) | CLOPEN learning-rate multiplier |
-| `--threads` | all cores | OpenMP threads |
+| Flag | Default |
+|---|---|
+| `--mode` | `causal` (or `bidir`) |
+| `--d` | 64 |
+| `--layers` | 7 |
+| `--T` | 64 |
+| `--K` | 3 (conv taps) |
+| `--batch` | 16 |
+| `--steps` | 3000 |
+| `--lr` | 3e-2 |
+| `--warmup` | 100 |
+| `--wd` | 0 |
+| `--mask` | 0.15 |
+| `--seed` | 0 |
+| `--threads` | all cores |
 
-Adam uses β = (0.9, 0.95). The data is any text file, tokenised to a character vocabulary.
+Adam uses β = (0.9, 0.95) with linear warmup, then linear decay. The data is any text file, tokenised to a character vocabulary.
 
-## Inference
+## Results
 
-```sh
-./infer bench    --model causal_ddlgn.bin --tokens 8192     # batched throughput (+ bit-sliced vs float check)
-./infer generate --model causal_mlp.bin --prompt "ROMEO:" --n 400 --temp 0.8
-./infer fill     --model bidir_mlp.bin  --text "Wh_t is th_ m_tter, my g_od lord?"
-```
+**Setup:** Tiny Shakespeare (1.1 MB, 65 characters, 90/10 split). One 4-core Xeon @ 2.1 GHz with AVX-512 and AMX.
 
-At load time, a DDLGN FFN is **hardened**: each gate's truth table becomes one of 16 two-input functions. Gates are sorted by type (with the wiring remapped) and evaluated **bit-sliced**, 512 tokens per `__m512i`, one `vpternlogd` per gate. GroupSum is a carry-save vertical popcount. `infer bench` checks that the bit-sliced engine reproduces the float hard path exactly.
-
-## Results (Tiny Shakespeare, d=64, 2 layers, T=64, batch 16, 3000 steps; 4-core Xeon @ 2.1 GHz, AVX-512)
-
-| Model | val loss | hardened | train tok/s | inference tok/s (8192-token batches) |
+| Model | Params | Val loss | Train time | Train tok/s |
 |---|---|---|---|---|
-| causal Walsh + ternary MLP | 1.775 | — | 266K | 2.2M |
-| causal Walsh + DDLGN | 1.880 | 1.880 | 134K | 2.9M (bit-sliced) |
-| bidir Walsh + ternary MLP (masked LM) | 1.620 | — | 256K | 2.2M |
-| bidir Walsh + DDLGN (masked LM) | 1.690 | 1.690 | 136K | 2.9M (bit-sliced) |
+| 7 × d64, causal, 3K steps × 16 × 64 | 96K | 1.718 | **5.8 s** | 530K (630K at batch 64) |
+| 7 × d64, masked LM (centred conv) | 96K | 1.329 (masked chars) | 5.3 s | 577K |
+| 12 × d128, causal, 8K steps × 32 × 64 | 611K | **1.523** | 125 s | 131K |
 
-- **Loss:** causal models use next-char loss in nats. Masked-LM models use loss on masked characters only, so the two aren't directly comparable.
-- **Agreement with the NumPy prototype** (`../research/bench.py`, same configs, 2 seeds): 1.771 / 1.778 (MLP) and 1.877 / 1.883 (DDLGN).
-- **Training speed:** the C trainer is about 7× faster than NumPy for the MLP model and about 95× faster for DDLGN, which NumPy can't vectorise well.
-- **Hardening:** the "hardened" column uses fixed boolean gates and binary inputs, i.e. what the bit-sliced engine runs. It costs nothing.
-
-### Logic FFNs vs no FFN (causal, same setup, mean of 2 seeds)
-
-| FFN | 3,000 steps | 10,000 steps (1 seed) |
+| Inference | 7 × d64 | 12 × d128 |
 |---|---|---|
-| none | 1.875 | 1.849 |
-| DDLGN, 8K gates | 1.880 | 1.850 |
-| CLOPEN-3, 8K gates | 1.874 | 1.845 |
-| ternary MLP | **1.766** | **1.715** |
+| Batched forward | 2.8–3.1M tok/s | 0.63M tok/s |
+| Streaming, 1 stream (1 core) | 280–310K tok/s (3.2–3.6 µs/token) | 58K tok/s (17 µs/token) |
+| Streaming, 64–1024 streams (4 cores) | **2.9M tok/s** | **1.0M tok/s** |
 
-With this Walsh mixer, which already contains a multiplicative gate, neither logic-gate FFN measurably beats having no FFN. That holds from 256 to 8K gates and out to 10K steps. Only the ternary MLP adds quality. In an attention model, DDLGN did help (1.991 vs 2.071 with no FFN).
+### Ablations that led here
 
-**Hardened inference cost:** at equal gate count, CLOPEN-3 is about 12% slower per gate than DDLGN (1.95 vs 1.73 ns per gate per 512 tokens). Both evaluate as a single `vpternlogd`; CLOPEN needs a third load. See `../research/clopen_gate_bench.c`.
+Same data, d=64, 3,000 steps, 2 seeds; the scripts are in `../research`.
 
-## Performance notes
+| Causal val loss | Params | Val loss |
+|---|---|---|
+| Attention + ternary MLP (BitNet baseline) | 107K | 1.814 |
+| Walsh long conv + short conv, + ternary MLP | 107K | 1.766 |
+| 7 × (Walsh long conv + short conv), no FFN | 124K | 1.734 |
+| **7 × short conv only (this)** | 96K | **1.715** |
 
-- **GEMM:** 8×32 register-blocked AVX-512 kernel with packed B panels (avoids 4K aliasing). About 130 GFLOP/s per core, and it scales linearly to 4 cores (~515 GFLOP/s).
-- **Weight gradients** (`xᵀ·dy`) use an in-register 16×16 AVX-512 transpose followed by the NN kernel.
-- **DDLGN training** runs in token tiles of 32 through all gate layers, so the working set stays in L2. The backward pass recomputes the tile's forward pass instead of storing activations.
-- **Profiling:** build with `-DWN_PROF` to get per-component timers (`g_prof`).
+- **Walsh long conv:** it mixes positions by XOR distance and didn't help. At T=256 it hurt more (1.768 vs 1.734).
+- **Logic-gate FFNs:** DDLGN and CLOPEN matched having no FFN at all.
+- **Masked LM:** with a centred conv, masked-LM loss improved from 1.604 (Walsh bidirectional) to 1.329.
 
 ## Limitations
 
-- **Hardware:** requires AVX-512F/BW/VNNI.
-- **Shapes:** `T` must be a power of 2 and `d` a multiple of 16.
-- **Generation** recomputes a sliding window of `T` tokens per new token. There is no incremental decode cache yet.
-- **Bidirectional mode** still uses the causal 3-tap short conv. A centred short conv would probably help masked-LM quality.
-- **Checkpoints** store weights only, not optimizer state, so training can't be resumed. The format is `WNT2`; the Config changed when CLOPEN was added.
-- **CLOPEN inference** uses the float path. A bit-sliced CLOPEN engine exists only in `../research/clopen_gate_bench.c`.
+- **Context:** receptive field = layers × (K−1) + 1 tokens (15 for 7 layers with K=3). Long-range dependencies need more depth, a bigger K, or a shift-invariant long convolution.
+- **Evaluation:** one small single-domain corpus, character level. Nothing here is tested at scale.
+- **Hardware:** requires AVX-512 (VNNI, BF16). AMX is used when present.
+- **Shapes:** `d` must be a multiple of 16, or 32 for the AMX path. The bidirectional mode needs an odd K.
+- **Checkpoints** hold weights only, not optimizer state.
