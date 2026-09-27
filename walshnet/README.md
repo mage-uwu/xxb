@@ -86,6 +86,20 @@ Adam uses β = (0.9, 0.95) with linear warmup, then linear decay. The data is an
 | Streaming, 1 stream (1 core) | 280–310K tok/s (3.2–3.6 µs/token) | 58K tok/s (17 µs/token) |
 | Streaming, 64–1024 streams (4 cores) | **2.9M tok/s** | **1.0M tok/s** |
 
+### 4M parameters, longer context (dilation)
+
+**Model:** 20 × d256 blocks, 3,997,184 params, T=256, 4,000 steps × 16 × 256 (16M tokens), about 30K tok/s, about 9 minutes per run.
+
+**Data:** the NLTK Gutenberg corpus, 18 books, 11.8M characters. Validation is the last 10%, which is almost all *Moby-Dick*, a book never seen in training.
+
+| Dilation | Receptive field | Val loss @1K | @2K | @3K | @4K |
+|---|---|---|---|---|---|
+| none | 41 | 1.731 | 1.629 | 1.597 | 1.557 |
+| cycle 6 (1..32) | 385 | 1.737 | **1.611** | **1.563** | **1.520** |
+
+- **Dilation helps on the bigger corpus:** −0.038 at 4K steps, with the gap widening as training goes on. One seed.
+- **On Tiny Shakespeare, dilation hurt the 4M model.** With only about 1M training characters, the extra reach went into memorising.
+
 ### Ablations that led here
 
 Same data, d=64, 3,000 steps, 2 seeds; the scripts are in `../research`.
