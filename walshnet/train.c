@@ -9,6 +9,7 @@ static void usage(void) {
         "  --mode causal|bidir   --ffn mlp|ddlgn|none   --d 64 --layers 2 --T 64 --hidden 256\n"
         "  --batch 16 --steps 3000 --lr 3e-2 --wd 0 --warmup 100 --seed 0 --mask 0.15\n"
         "  --dl-width 2048 --dl-depth 4 --dl-nth 8 --dl-temp 0.5 --dl-z 1 --dl-lrmul 10\n"
+        "  --cl-width 2048 --cl-depth 4 --cl-fanin 3 --cl-nth 8 --cl-temp 0.5 --cl-ste clip|id --cl-lrmul 1\n"
         "  --eval-every 500 --eval-windows 256 --out model.bin --threads N\n");
     exit(1);
 }
@@ -52,7 +53,8 @@ static double evaluate(Model *m, const int *val, size_t len, const Opts *o, int 
 
 int main(int argc, char **argv) {
     Config c = {.d = 64, .n_layers = 2, .T = 64, .mode = MODE_CAUSAL, .ffn = FFN_MLP, .hidden = 0,
-                .dl_width = 2048, .dl_depth = 4, .dl_nth = 8, .dl_temp = 0.5f, .dl_z = 1.0f, .dl_lr_mul = 10.0f, .seed = 0};
+                .dl_width = 2048, .dl_depth = 4, .dl_nth = 8, .dl_temp = 0.5f, .dl_z = 1.0f, .dl_lr_mul = 10.0f, .seed = 0,
+                .cl_width = 2048, .cl_depth = 4, .cl_fanin = 3, .cl_nth = 8, .cl_ste = 1, .cl_temp = 0.5f, .cl_lr_mul = 1.0f};
     Opts o = {.data = NULL, .out = "model.bin", .steps = 3000, .batch = 16, .eval_every = 500, .eval_windows = 256,
               .warmup = 100, .lr = 3e-2f, .wd = 0, .mask_p = 0.15f};
     for (int i = 1; i < argc; i++) {
@@ -61,7 +63,7 @@ int main(int argc, char **argv) {
         if      ARG("--data") o.data = v;
         else if ARG("--out") o.out = v;
         else if ARG("--mode") c.mode = !strcmp(v, "bidir") ? MODE_BIDIR : MODE_CAUSAL;
-        else if ARG("--ffn") c.ffn = !strcmp(v, "ddlgn") ? FFN_DDLGN : !strcmp(v, "none") ? FFN_NONE : FFN_MLP;
+        else if ARG("--ffn") c.ffn = !strcmp(v, "ddlgn") ? FFN_DDLGN : !strcmp(v, "clopen") ? FFN_CLOPEN : !strcmp(v, "none") ? FFN_NONE : FFN_MLP;
         else if ARG("--d") c.d = atoi(v);
         else if ARG("--layers") c.n_layers = atoi(v);
         else if ARG("--T") c.T = atoi(v);
@@ -73,6 +75,13 @@ int main(int argc, char **argv) {
         else if ARG("--dl-temp") c.dl_temp = atof(v);
         else if ARG("--dl-z") c.dl_z = atof(v);
         else if ARG("--dl-lrmul") c.dl_lr_mul = atof(v);
+        else if ARG("--cl-width") c.cl_width = atoi(v);
+        else if ARG("--cl-depth") c.cl_depth = atoi(v);
+        else if ARG("--cl-fanin") c.cl_fanin = atoi(v);
+        else if ARG("--cl-nth") c.cl_nth = atoi(v);
+        else if ARG("--cl-temp") c.cl_temp = atof(v);
+        else if ARG("--cl-ste") c.cl_ste = !strcmp(v, "clip");
+        else if ARG("--cl-lrmul") c.cl_lr_mul = atof(v);
         else if ARG("--batch") o.batch = atoi(v);
         else if ARG("--steps") o.steps = atoi(v);
         else if ARG("--lr") o.lr = atof(v);
@@ -93,7 +102,7 @@ int main(int argc, char **argv) {
     const int B = o.batch, N = B * c.T;
     Model m; model_init(&m, &c, N);
     printf("walshnet | %s LM | mixer: walsh-%s | ffn: %s | d=%d layers=%d T=%d | vocab %d | %zu params | %d threads\n",
-           c.mode ? "masked" : "causal", c.mode ? "bidir" : "causal", c.ffn == FFN_MLP ? "ternary MLP" : c.ffn == FFN_DDLGN ? "DDLGN" : "none",
+           c.mode ? "masked" : "causal", c.mode ? "bidir" : "causal", c.ffn == FFN_MLP ? "ternary MLP" : c.ffn == FFN_DDLGN ? "DDLGN" : c.ffn == FFN_CLOPEN ? "CLOPEN" : "none",
            c.d, c.n_layers, c.T, c.vocab, model_n_params(&m), omp_get_max_threads());
     int *tok = malloc(sizeof(int) * N), *tgt = malloc(sizeof(int) * N);
     Rng r = rng_seed(1000 + c.seed);
@@ -116,6 +125,10 @@ int main(int argc, char **argv) {
     if (c.ffn == FFN_DDLGN) {
         float ch = 0; for (int l = 0; l < c.n_layers; l++) ch += dl_gates_changed(&m.dl[l]) / c.n_layers;
         printf(" | hardened gates: val %.4f | gates changed %.0f%%", evaluate(&m, val, n_val, &o, B, 1), 100 * ch);
+    }
+    if (c.ffn == FFN_CLOPEN) {
+        float ch = 0; for (int l = 0; l < c.n_layers; l++) ch += cl_gates_changed(&m.cl[l]) / c.n_layers;
+        printf(" | gates changed %.0f%%", 100 * ch);
     }
     printf(" | train throughput %.0f tok/s\n", (double)o.steps * N / t_train);
     if (model_save(&m, o.out, vocab)) fprintf(stderr, "could not save %s\n", o.out); else printf("saved %s\n", o.out);

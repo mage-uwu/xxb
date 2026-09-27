@@ -171,7 +171,8 @@ static void engine_forward(Engine *e, const int *tok, int N, int bitsliced, doub
         if (m->mlp) mlp_forward(&m->mlp[l], x, N, m->tmp);
         else if (m->dl && bitsliced) hdl_forward(&e->hdl[l], x, N, m->tmp, e->hs);
         else if (m->dl) dl_forward(&m->dl[l], x, N, m->tmp, 1);
-        if (m->mlp || m->dl) for (size_t i = 0; i < (size_t)N * d; i++) x[i] += m->tmp[i];
+        else if (m->cl) cl_forward(&m->cl[l], x, N, m->tmp);
+        if (m->mlp || m->dl || m->cl) for (size_t i = 0; i < (size_t)N * d; i++) x[i] += m->tmp[i];
         double t2 = now_sec();
         if (t_mix) { *t_mix += t1 - t0; *t_ffn += t2 - t1; }
     }

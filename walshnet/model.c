@@ -15,7 +15,8 @@ void model_init(Model *m, const Config *c, int cap) {
     m->mix = calloc(L, sizeof(WalshMix));
     if (c->ffn == FFN_MLP) m->mlp = calloc(L, sizeof(MLP));
     if (c->ffn == FFN_DDLGN) m->dl = calloc(L, sizeof(DDLGN));
-    m->params = calloc(2 + L * (4 + 2 + (c->ffn == FFN_DDLGN ? c->dl_depth + 1 : 0)), sizeof(Param *));
+    if (c->ffn == FFN_CLOPEN) m->cl = calloc(L, sizeof(Clopen));
+    m->params = calloc(2 + L * (4 + 2 + (c->ffn == FFN_DDLGN ? c->dl_depth + 1 : 0) + (c->ffn == FFN_CLOPEN ? 2 * c->cl_depth + 1 : 0)), sizeof(Param *));
     add_param(m, &m->emb); add_param(m, &m->head);
     for (int i = 0; i < L; i++) {
         wm_init(&m->mix[i], d, c->T, c->mode, cap, &rng);
@@ -27,6 +28,10 @@ void model_init(Model *m, const Config *c, int cap) {
             dl_init(&m->dl[i], d, c->dl_nth, c->dl_temp, c->dl_width, c->dl_depth, c->dl_z, c->dl_lr_mul, cap, &rng);
             for (int j = 0; j < c->dl_depth; j++) add_param(m, &m->dl[i].theta[j]);
             add_param(m, &m->dl[i].gain);
+        } else if (c->ffn == FFN_CLOPEN) {
+            cl_init(&m->cl[i], d, c->cl_nth, c->cl_temp, c->cl_width, c->cl_depth, c->cl_fanin, c->cl_ste, c->cl_lr_mul, cap, &rng);
+            for (int j = 0; j < c->cl_depth; j++) { add_param(m, &m->cl[i].w[j]); add_param(m, &m->cl[i].theta[j]); }
+            add_param(m, &m->cl[i].gain);
         }
     }
     m->xs = malloc(sizeof(float *) * (2 * L + 1));
@@ -64,6 +69,7 @@ double model_step(Model *m, const int *tok, const int *tgt, int N, int grad, int
         memcpy(m->xs[2 * i + 2], m->xs[2 * i + 1], 4 * nd);
         if (m->mlp) { mlp_forward(&m->mlp[i], m->xs[2 * i + 1], N, m->tmp); add_into(m->xs[2 * i + 2], m->tmp, nd); }
         if (m->dl)  { PROF(P_DLF, dl_forward(&m->dl[i], m->xs[2 * i + 1], N, m->tmp, hard)); add_into(m->xs[2 * i + 2], m->tmp, nd); }
+        if (m->cl)  { PROF(P_DLF, cl_forward(&m->cl[i], m->xs[2 * i + 1], N, m->tmp)); add_into(m->xs[2 * i + 2], m->tmp, nd); }
     }
     const float *xf = m->xs[2 * L];
     #pragma omp parallel for schedule(static)
@@ -107,6 +113,7 @@ double model_step(Model *m, const int *tok, const int *tgt, int N, int grad, int
     for (int i = L - 1; i >= 0; i--) {
         if (m->mlp) { mlp_backward(&m->mlp[i], m->dx, m->dtmp); add_into(m->dx, m->dtmp, nd); }
         if (m->dl)  { PROF(P_DLB, dl_backward(&m->dl[i], m->dx, m->dtmp)); add_into(m->dx, m->dtmp, nd); }
+        if (m->cl)  { PROF(P_DLB, cl_backward(&m->cl[i], m->dx, m->dtmp)); add_into(m->dx, m->dtmp, nd); }
         wm_backward(&m->mix[i], m->dx, m->dtmp); add_into(m->dx, m->dtmp, nd);
     }
     for (int n = 0; n < N; n++) {                                          // embedding grad
@@ -141,23 +148,29 @@ void adam_step(Model *m, float lr, int t, float b1, float b2, float wd) {
 /* ---- checkpoints: magic, Config, vocab chars[256], params (w only), DDLGN wiring */
 int model_save(const Model *m, const char *path, const unsigned char *vocab_chars) {
     FILE *f = fopen(path, "wb"); if (!f) return -1;
-    fwrite("WNT1", 1, 4, f); fwrite(&m->c, sizeof(Config), 1, f); fwrite(vocab_chars, 1, 256, f);
+    fwrite("WNT2", 1, 4, f); fwrite(&m->c, sizeof(Config), 1, f); fwrite(vocab_chars, 1, 256, f);
     for (int i = 0; i < m->n_params; i++) fwrite(m->params[i]->w, 4, m->params[i]->n, f);
     if (m->dl) for (int l = 0; l < m->c.n_layers; l++) for (int j = 0; j < m->c.dl_depth; j++) {
         fwrite(m->dl[l].ia[j], 4, m->c.dl_width, f); fwrite(m->dl[l].ib[j], 4, m->c.dl_width, f);
     }
+    if (m->cl) for (int l = 0; l < m->c.n_layers; l++) for (int j = 0; j < m->c.cl_depth; j++)
+        fwrite(m->cl[l].idx[j], 4, (size_t)m->c.cl_width * m->c.cl_fanin, f);
     fclose(f); return 0;
 }
 
 int model_load(Model *m, const char *path, unsigned char *vocab_chars, int cap) {
     FILE *f = fopen(path, "rb"); if (!f) return -1;
     char magic[4]; Config c;
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "WNT1", 4) || fread(&c, sizeof(Config), 1, f) != 1) { fclose(f); return -2; }
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "WNT2", 4) || fread(&c, sizeof(Config), 1, f) != 1) { fclose(f); return -2; }
     if (fread(vocab_chars, 1, 256, f) != 256) { fclose(f); return -2; }
     model_init(m, &c, cap);
     for (int i = 0; i < m->n_params; i++) if (fread(m->params[i]->w, 4, m->params[i]->n, f) != m->params[i]->n) { fclose(f); return -3; }
     if (m->dl) for (int l = 0; l < c.n_layers; l++) for (int j = 0; j < c.dl_depth; j++) {
         if (fread(m->dl[l].ia[j], 4, c.dl_width, f) != (size_t)c.dl_width || fread(m->dl[l].ib[j], 4, c.dl_width, f) != (size_t)c.dl_width) { fclose(f); return -3; }
+    }
+    if (m->cl) for (int l = 0; l < c.n_layers; l++) for (int j = 0; j < c.cl_depth; j++) {
+        const size_t n = (size_t)c.cl_width * c.cl_fanin;
+        if (fread(m->cl[l].idx[j], 4, n, f) != n) { fclose(f); return -3; }
     }
     fclose(f); model_prepare(m); return 0;
 }

@@ -116,19 +116,39 @@ void dl_forward(DDLGN *f, const float *x, int N, float *y, int hard);
 void dl_backward(DDLGN *f, const float *dy, float *dx);
 float dl_gates_changed(const DDLGN *f);         // fraction of gates whose hard truth table != pass-through A
 
+// CLOPEN FFN: layers of ternary threshold gates over {-1,+1} states. The training forward pass IS the inference
+// function (no relaxation). Gate: out = sign(sum_j q3(w_j) x[idx_j] - theta), q3 = round+clamp to {-1,0,+1}, fixed
+// random wiring with fan-in G, thermometer sign inputs, GroupSum readout. Backward: straight-through estimator,
+// identity (ste=0) or clipped to |pre-activation| <= 1 (ste=1).
+typedef struct {
+    int d, nth, width, depth, fanin, k, cap, ste; float temp;
+    float th[16];
+    int32_t **idx;                               // per layer [width][fanin]
+    Param *w, *theta;                            // per layer latent weights [width][fanin], thresholds [width]
+    Param gain;                                  // [d]
+    float *wq;                                   // quantized weights [depth][width][fanin]
+    int N; float *xn, *r, *xnT, *in0, *gs, *dxn; // in0: input sign bits, gate-major [d*nth][cap]
+    float *acts, *pre, *gbuf, *wpart;            // per-thread tile buffers and partial grads
+} Clopen;
+void cl_init(Clopen *f, int d, int nth, float temp, int width, int depth, int fanin, int ste, float lr_mul, int cap, Rng *rng);
+void cl_forward(Clopen *f, const float *x, int N, float *y);
+void cl_backward(Clopen *f, const float *dy, float *dx);
+float cl_gates_changed(const Clopen *f);         // fraction of gates no longer computing pass-through of input 0
+
 /* ------------------------------------------------------------------ model */
-enum { FFN_MLP = 0, FFN_DDLGN = 1, FFN_NONE = 2 };
+enum { FFN_MLP = 0, FFN_DDLGN = 1, FFN_NONE = 2, FFN_CLOPEN = 3 };
 typedef struct {
     int vocab;                                   // model vocab (bidir adds +1 [MASK] token internally)
     int d, n_layers, T, mode, ffn, hidden;
     int dl_width, dl_depth, dl_nth; float dl_temp, dl_z, dl_lr_mul;
     uint64_t seed;
+    int cl_width, cl_depth, cl_fanin, cl_nth, cl_ste; float cl_temp, cl_lr_mul;
 } Config;
 
 typedef struct {
     Config c; int V_in, cap;                     // V_in = embedding rows
     Param emb, head;                             // [V_in][d], [d][vocab]
-    WalshMix *mix; MLP *mlp; DDLGN *dl;
+    WalshMix *mix; MLP *mlp; DDLGN *dl; Clopen *cl;
     Param **params; int n_params;
     // activations
     float **xs;                                  // residual stream per sub-layer: xs[0..2L] each [cap][d]

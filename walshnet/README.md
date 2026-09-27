@@ -8,6 +8,7 @@ Pure C (C11 + AVX-512 + OpenMP, no dependencies) pretraining and inference for *
 - **FFN**, one of:
   - **ternary MLP:** BitNet b1.58, ReLU².
   - **light DDLGN:** differentiable logic-gate network. 4 truth-table logits per 2-input gate, fixed random wiring, residual (pass-through) init, thermometer-encoded inputs, GroupSum readout.
+  - **CLOPEN:** ternary threshold gates over ±1 states, `sign(Σ q3(w)·x − θ)`, with fan-in G, fixed random wiring, pass-through init, thermometer sign inputs and a clipped straight-through estimator. The training forward pass *is* the inference function, with no relaxation.
 - **BitLinear** (BitNet b1.58): per-token RMSNorm, then int8 absmax activations × ternary absmean weights. The forward pass is the *exact* int8 × ternary product on AVX-512 VNNI (`vpdpbusd`). Training uses the straight-through estimator with fp32 backward GEMMs.
 
 ## Build and test
@@ -24,6 +25,7 @@ make            # train, infer, test   (needs gcc/clang with AVX-512 VNNI + Open
 ./train --data input.txt --mode causal --ffn ddlgn --out causal_ddlgn.bin
 ./train --data input.txt --mode bidir  --ffn mlp   --out bidir_mlp.bin      # masked LM, 15% masking (80/10/10)
 ./train --data input.txt --mode bidir  --ffn ddlgn --out bidir_ddlgn.bin
+./train --data input.txt --mode causal --ffn clopen --cl-lrmul 3 --out causal_clopen.bin
 ```
 
 Options:
@@ -43,6 +45,10 @@ Options:
 | `--dl-temp` | 0.5 | thermometer sigmoid temperature |
 | `--dl-z` | 1 | residual-init strength (truth-table logits start at ±z) |
 | `--dl-lrmul` | 10 | gate learning-rate multiplier |
+| `--cl-width` / `--cl-depth` / `--cl-fanin` | 2048 / 4 / 3 | CLOPEN gates per layer, layers, and inputs per gate |
+| `--cl-nth` / `--cl-temp` | 8 / 0.5 | CLOPEN thermometer thresholds and STE window scale |
+| `--cl-ste` | clip | `clip` passes gradients only when \|pre-activation\| ≤ 1; `id` always passes them |
+| `--cl-lrmul` | 1 (3 works best) | CLOPEN learning-rate multiplier |
 | `--threads` | all cores | OpenMP threads |
 
 Adam uses β = (0.9, 0.95). The data is any text file, tokenised to a character vocabulary.
@@ -71,6 +77,19 @@ At load time, a DDLGN FFN is **hardened**: each gate's truth table becomes one o
 - **Training speed:** the C trainer is about 7× faster than NumPy for the MLP model and about 95× faster for DDLGN, which NumPy can't vectorise well.
 - **Hardening:** the "hardened" column uses fixed boolean gates and binary inputs, i.e. what the bit-sliced engine runs. It costs nothing.
 
+### Logic FFNs vs no FFN (causal, same setup, mean of 2 seeds)
+
+| FFN | 3,000 steps | 10,000 steps (1 seed) |
+|---|---|---|
+| none | 1.875 | 1.849 |
+| DDLGN, 8K gates | 1.880 | 1.850 |
+| CLOPEN-3, 8K gates | 1.874 | 1.845 |
+| ternary MLP | **1.766** | **1.715** |
+
+With this Walsh mixer, which already contains a multiplicative gate, neither logic-gate FFN measurably beats having no FFN. That holds from 256 to 8K gates and out to 10K steps. Only the ternary MLP adds quality. In an attention model, DDLGN did help (1.991 vs 2.071 with no FFN).
+
+**Hardened inference cost:** at equal gate count, CLOPEN-3 is about 12% slower per gate than DDLGN (1.95 vs 1.73 ns per gate per 512 tokens). Both evaluate as a single `vpternlogd`; CLOPEN needs a third load. See `../research/clopen_gate_bench.c`.
+
 ## Performance notes
 
 - **GEMM:** 8×32 register-blocked AVX-512 kernel with packed B panels (avoids 4K aliasing). About 130 GFLOP/s per core, and it scales linearly to 4 cores (~515 GFLOP/s).
@@ -84,4 +103,5 @@ At load time, a DDLGN FFN is **hardened**: each gate's truth table becomes one o
 - **Shapes:** `T` must be a power of 2 and `d` a multiple of 16.
 - **Generation** recomputes a sliding window of `T` tokens per new token. There is no incremental decode cache yet.
 - **Bidirectional mode** still uses the causal 3-tap short conv. A centred short conv would probably help masked-LM quality.
-- **Checkpoints** store weights only, not optimizer state, so training can't be resumed.
+- **Checkpoints** store weights only, not optimizer state, so training can't be resumed. The format is `WNT2`; the Config changed when CLOPEN was added.
+- **CLOPEN inference** uses the float path. A bit-sliced CLOPEN engine exists only in `../research/clopen_gate_bench.c`.

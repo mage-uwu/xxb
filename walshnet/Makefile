@@ -1,7 +1,7 @@
 CC      ?= gcc
 CFLAGS  ?= -O3 -march=native -fopenmp -ffp-contract=fast -fno-math-errno -Wall -Wextra -Wno-unused-parameter
 LDLIBS  = -lm
-CORE    = gemm.o bitlinear.o walsh.o mlp.o logic.o model.o
+CORE    = gemm.o bitlinear.o walsh.o mlp.o logic.o clopen.o model.o
 
 all: train infer test
 

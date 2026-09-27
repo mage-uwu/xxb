@@ -126,12 +126,79 @@ static void test_causality(void) {
     printf("causality: editing token 40 changes logits at t<40 by %g, at t>=40 by %.3f\n", before, after);
 }
 
+static void test_clopen(int fanin, int ste) {
+    Rng r = rng_seed(11 + fanin + 7 * ste); Clopen f; const int d = 16, nth = 4, W = 64, depth = 3, N = 48, k = W / d;
+    cl_init(&f, d, nth, 0.7f, W, depth, fanin, ste, 1.0f, N, &r);
+    for (int i = 0; i < depth; i++) {
+        for (size_t e = 0; e < f.w[i].n; e++) f.w[i].w[e] = 2.4f * rng_unif(&r) - 1.2f;
+        for (int g = 0; g < W; g++) f.theta[i].w[g] = 4.0f * rng_unif(&r) - 2.0f;
+    }
+    for (int c = 0; c < d; c++) f.gain.w[c] = 0.5f + rng_unif(&r);
+    float *x = xmalloc(4 * N * d), *y = xmalloc(4 * N * d), *dy = xmalloc(4 * N * d), *dx = xmalloc(4 * N * d);
+    for (int i = 0; i < N * d; i++) { x[i] = rng_normal(&r); dy[i] = rng_normal(&r); }
+    cl_forward(&f, x, N, y); cl_backward(&f, dy, dx);
+    // ---- naive reference
+    const int n_in0 = d * nth, maxr = W > n_in0 ? W : n_in0;
+    double *act = calloc((size_t)(depth + 1) * maxr * N, 8), *pre = calloc((size_t)depth * W * N, 8), *xn = calloc(N * d, 8), *rr = calloc(N, 8);
+    #define ACT(l, g, n) act[((size_t)(l) * maxr + (g)) * N + (n)]
+    #define PRE(l, g, n) pre[((size_t)(l) * W + (g)) * N + (n)]
+    for (int n = 0; n < N; n++) {
+        double ss = 0; for (int c = 0; c < d; c++) ss += (double)x[n * d + c] * x[n * d + c];
+        rr[n] = 1.0 / sqrt(ss / d + 1e-6);
+        for (int c = 0; c < d; c++) { xn[n * d + c] = x[n * d + c] * rr[n]; for (int j = 0; j < nth; j++) ACT(0, c * nth + j, n) = xn[n * d + c] > f.th[j] ? 1 : -1; }
+    }
+    #define Q3(v) (fmax(-1.0, fmin(1.0, rint(v))))
+    for (int l = 0; l < depth; l++) for (int g = 0; g < W; g++) for (int n = 0; n < N; n++) {
+        double s = -f.theta[l].w[g];
+        for (int j = 0; j < fanin; j++) s += Q3(f.w[l].w[g * fanin + j]) * ACT(l, f.idx[l][g * fanin + j], n);
+        PRE(l, g, n) = s; ACT(l + 1, g, n) = s >= 0 ? 1 : -1;
+    }
+    double err_y = 0;
+    for (int n = 0; n < N; n++) for (int c = 0; c < d; c++) {
+        double s = 0; for (int q = 0; q < k; q++) s += ACT(depth, c * k + q, n);
+        err_y = fmax(err_y, fabs(0.5 * s / k * f.gain.w[c] - y[n * d + c]));
+    }
+    double *gout = calloc((size_t)maxr * N, 8), *gin = calloc((size_t)maxr * N, 8), err_w = 0, err_t = 0, err_x = 0;
+    for (int n = 0; n < N; n++) for (int c = 0; c < d; c++) for (int q = 0; q < k; q++) gout[(size_t)(c * k + q) * N + n] = dy[n * d + c] * f.gain.w[c] * 0.5 / k;
+    for (int l = depth - 1; l >= 0; l--) {
+        memset(gin, 0, 8 * (size_t)maxr * N);
+        for (int g = 0; g < W; g++) {
+            double dth = 0, dw[16] = {0};
+            for (int n = 0; n < N; n++) {
+                const double gy = gout[(size_t)g * N + n] * (ste ? fabs(PRE(l, g, n)) <= 1.0 : 1.0);
+                dth -= gy;
+                for (int j = 0; j < fanin; j++) {
+                    const int s = f.idx[l][g * fanin + j];
+                    dw[j] += gy * ACT(l, s, n); gin[(size_t)s * N + n] += gy * Q3(f.w[l].w[g * fanin + j]);
+                }
+            }
+            err_t = fmax(err_t, fabs(dth - f.theta[l].g[g]) / (1 + fabs(dth)));
+            for (int j = 0; j < fanin; j++) err_w = fmax(err_w, fabs(dw[j] - f.w[l].g[g * fanin + j]) / (1 + fabs(dw[j])));
+        }
+        double *tmp = gout; gout = gin; gin = tmp;
+    }
+    for (int n = 0; n < N; n++) {
+        double dxn[64], dot = 0;
+        for (int c = 0; c < d; c++) {
+            double a = 0;
+            for (int j = 0; j < nth; j++) { const double u = (xn[n * d + c] - f.th[j]) / 0.7; a += gout[(size_t)(c * nth + j) * N + n] * (ste ? fabs(u) <= 1.0 : 1.0); }
+            dxn[c] = a / 0.7; dot += dxn[c] * xn[n * d + c];
+        }
+        dot /= d;
+        for (int c = 0; c < d; c++) err_x = fmax(err_x, fabs(rr[n] * (dxn[c] - xn[n * d + c] * dot) - dx[n * d + c]) / (1 + fabs(dx[n * d + c])));
+    }
+    CHECK(err_y < 1e-5 && err_w < 1e-4 && err_t < 1e-4 && err_x < 1e-4, "clopen fanin=%d ste=%d: y %g w %g theta %g x %g", fanin, ste, err_y, err_w, err_t, err_x);
+    printf("clopen fanin=%d ste=%-4s: forward + STE grads match naive reference (max err y %.1e, w %.1e, theta %.1e, x %.1e)\n",
+           fanin, ste ? "clip" : "id", err_y, err_w, err_t, err_x);
+}
+
 int main(void) {
     printf("threads: %d\n", omp_get_max_threads());
     test_sgemm(); test_bitlinear();
     test_longconv(MODE_CAUSAL); test_longconv(MODE_BIDIR);
     for (int mode = 0; mode < 2; mode++) for (int ffn = 0; ffn < 2; ffn++) test_gradients(mode, ffn);
     test_causality();
+    for (int ste = 0; ste < 2; ste++) { test_clopen(3, ste); test_clopen(8, ste); }
     printf(fails ? "\n%d FAILURES\n" : "\nall tests passed\n", fails);
     return fails != 0;
 }
