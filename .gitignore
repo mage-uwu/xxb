@@ -1,0 +1,8 @@
+*.o
+*.bin
+walshnet/train
+walshnet/infer
+walshnet/test
+__pycache__/
+*.jsonl
+shakespeare.txt
