@@ -15,7 +15,7 @@ void model_init(Model *m, const Config *c, int cap) {
     m->params = calloc(2 + 3 * L, sizeof(Param *));
     m->params[m->n_params++] = &m->emb; m->params[m->n_params++] = &m->head;
     for (int i = 0; i < L; i++) {
-        blk_init(&m->blk[i], d, c->T, c->K, c->mode, cap, &rng);
+        blk_init(&m->blk[i], d, c->T, c->K, c->mode, model_dil(c->dil_cycle, i), cap, &rng);
         m->params[m->n_params++] = &m->blk[i].inp.W; m->params[m->n_params++] = &m->blk[i].out.W; m->params[m->n_params++] = &m->blk[i].cw;
     }
     m->xs = malloc(sizeof(float *) * (L + 1));
@@ -124,10 +124,10 @@ void adam_step(Model *m, float lr, int t, float b1, float b2, float wd) {
     model_prepare(m);
 }
 
-/* checkpoint: magic "WSC1", Config, vocab chars[256], params (weights only) */
+/* checkpoint: magic "WSC2", Config, vocab chars[256], params (weights only) */
 int model_save(const Model *m, const char *path, const unsigned char *vocab_chars) {
     FILE *f = fopen(path, "wb"); if (!f) return -1;
-    fwrite("WSC1", 1, 4, f); fwrite(&m->c, sizeof(Config), 1, f); fwrite(vocab_chars, 1, 256, f);
+    fwrite("WSC2", 1, 4, f); fwrite(&m->c, sizeof(Config), 1, f); fwrite(vocab_chars, 1, 256, f);
     for (int i = 0; i < m->n_params; i++) fwrite(m->params[i]->w, 4, m->params[i]->n, f);
     fclose(f); return 0;
 }
@@ -135,7 +135,7 @@ int model_save(const Model *m, const char *path, const unsigned char *vocab_char
 int model_load(Model *m, const char *path, unsigned char *vocab_chars, int cap) {
     FILE *f = fopen(path, "rb"); if (!f) return -1;
     char magic[4]; Config c;
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "WSC1", 4) || fread(&c, sizeof(Config), 1, f) != 1 || fread(vocab_chars, 1, 256, f) != 256) { fclose(f); return -2; }
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "WSC2", 4) || fread(&c, sizeof(Config), 1, f) != 1 || fread(vocab_chars, 1, 256, f) != 256) { fclose(f); return -2; }
     model_init(m, &c, cap);
     for (int i = 0; i < m->n_params; i++) if (fread(m->params[i]->w, 4, m->params[i]->n, f) != m->params[i]->n) { fclose(f); return -3; }
     fclose(f); model_prepare(m); return 0;

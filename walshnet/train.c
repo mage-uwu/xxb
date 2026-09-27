@@ -1,14 +1,14 @@
 // walshnet pretraining: causal LM (causal short conv) or masked LM (centred short conv) on a byte/char corpus.
 #include "wn.h"
 
-typedef struct { const char *data, *out; int steps, batch, eval_every, eval_windows, warmup; float lr, wd, mask_p; } Opts;
+typedef struct { const char *data, *out; int steps, batch, eval_every, eval_windows, warmup, save_best; float lr, wd, mask_p; } Opts;
 
 static void usage(void) {
     fprintf(stderr,
         "usage: train --data FILE [options]\n"
-        "  --mode causal|bidir  --d 64 --layers 7 --T 64 --K 3\n"
+        "  --mode causal|bidir  --d 64 --layers 7 --T 64 --K 3 --dilate 0 (cycle c: layer l spacing 2^(l mod c))\n"
         "  --batch 16 --steps 3000 --lr 3e-2 --wd 0 --warmup 100 --seed 0 --mask 0.15\n"
-        "  --eval-every 500 --eval-windows 256 --out model.bin --threads N\n");
+        "  --eval-every 500 --eval-windows 256 --out model.bin --save-best --threads N\n");
     exit(1);
 }
 
@@ -63,6 +63,8 @@ int main(int argc, char **argv) {
         else if ARG("--layers") c.n_layers = atoi(v);
         else if ARG("--T") c.T = atoi(v);
         else if ARG("--K") c.K = atoi(v);
+        else if ARG("--dilate") c.dil_cycle = atoi(v);
+        else if (!strcmp(a, "--save-best")) o.save_best = 1;
         else if ARG("--seed") c.seed = strtoull(v, 0, 10);
         else if ARG("--batch") o.batch = atoi(v);
         else if ARG("--steps") o.steps = atoi(v);
@@ -84,12 +86,14 @@ int main(int argc, char **argv) {
     Model m; model_init(&m, &c, N);
     printf("walshnet | %s LM | %d x gated %s short-conv (K=%d) BitNet blocks | d=%d T=%d | vocab %d | %zu params | %d threads | AMX %s\n",
            c.mode ? "masked" : "causal", c.n_layers, c.mode ? "centred" : "causal", c.K, c.d, c.T, c.vocab, model_n_params(&m), omp_get_max_threads(), g_amx ? "on" : "off");
+    int rf = 1; for (int l = 0; l < c.n_layers; l++) rf += (c.mode ? c.K / 2 : c.K - 1) * model_dil(c.dil_cycle, l);
+    printf("receptive field: %d tokens%s | training window T=%d\n", rf, c.mode ? " each side" : "", c.T);
     int R = omp_get_max_threads(); if (R > B) R = B;                       // data-parallel replicas (one per thread)
     Model *reps = NULL;
     if (R > 1) { reps = calloc(R, sizeof(Model)); for (int i = 0; i < R; i++) model_init_replica(&reps[i], &m, ((B + R - 1) / R) * c.T); }
     int *tok = malloc(sizeof(int) * N), *tgt = malloc(sizeof(int) * N);
     Rng r = rng_seed(1000 + c.seed);
-    double t_train = 0, run_loss = 0; int run_n = 0;
+    double t_train = 0, run_loss = 0, best_val = 1e9; int run_n = 0;
     for (int it = 1; it <= o.steps; it++) {
         make_batch(train, n_train, &c, B, o.mask_p, &r, tok, tgt);
         const double t0 = now_sec();
@@ -100,11 +104,15 @@ int main(int argc, char **argv) {
         t_train += now_sec() - t0;
         if (it % o.eval_every == 0 || it == o.steps) {
             const double vl = evaluate(&m, val, n_val, &o, B);
-            printf("step %5d | train %.4f | val %.4f | %.0f tok/s | %.1fs\n", it, run_loss / run_n, vl, (double)it * N / t_train, t_train);
+            const int improved = vl < best_val; if (improved) best_val = vl;
+            printf("step %5d | train %.4f | val %.4f%s | %.0f tok/s | %.1fs\n", it, run_loss / run_n, vl, improved && o.save_best ? " *" : "", (double)it * N / t_train, t_train);
+            if (improved && o.save_best) model_save(&m, o.out, vocab);
             fflush(stdout); run_loss = 0; run_n = 0;
         }
     }
-    printf("final val %.4f | train throughput %.0f tok/s | %.1fs\n", evaluate(&m, val, n_val, &o, B), (double)o.steps * N / t_train, t_train);
-    if (model_save(&m, o.out, vocab)) fprintf(stderr, "could not save %s\n", o.out); else printf("saved %s\n", o.out);
+    const double fv = evaluate(&m, val, n_val, &o, B);
+    printf("final val %.4f | best val %.4f | train throughput %.0f tok/s | %.1fs\n", fv, fv < best_val ? fv : best_val, (double)o.steps * N / t_train, t_train);
+    if (o.save_best && fv >= best_val) printf("kept best checkpoint in %s (val %.4f)\n", o.out, best_val);
+    else if (model_save(&m, o.out, vocab)) fprintf(stderr, "could not save %s\n", o.out); else printf("saved %s\n", o.out);
     return 0;
 }

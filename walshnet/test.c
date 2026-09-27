@@ -79,9 +79,9 @@ static void test_amx(void) {
     printf("amx                          : int8 BitLinear fwd == VNNI (max err %.1e); bf16 tiles == AVX-512 bf16 (rel err %.1e)\n", ef, eg);
 }
 
-static void test_gradients(int mode, int K) {
+static void test_gradients(int mode, int K, int dc) {
     g_noquant = 1;
-    Config c = {.vocab = 11, .d = 16, .n_layers = 3, .T = 16, .K = K, .mode = mode, .seed = 7};
+    Config c = {.vocab = 11, .d = 16, .n_layers = 3, .T = 16, .K = K, .mode = mode, .dil_cycle = dc, .seed = 7};
     const int N = 3 * c.T; Model m; model_init(&m, &c, N);
     Rng r = rng_seed(4);
     int *tok = malloc(4 * N), *tgt = malloc(4 * N);
@@ -100,32 +100,33 @@ static void test_gradients(int mode, int K) {
             worst = fmax(worst, fabs(num - ana) / (fabs(num) + fabs(ana))); checked++;
         }
     }
-    CHECK(worst < 2e-2, "gradcheck mode=%d K=%d worst %g", mode, K, worst);
-    printf("gradcheck %-6s K=%d          : worst rel err %.1e over %d entries\n", mode ? "bidir" : "causal", K, worst, checked);
+    CHECK(worst < 2e-2, "gradcheck mode=%d K=%d dil=%d worst %g", mode, K, dc, worst);
+    printf("gradcheck %-6s K=%d dil=%d    : worst rel err %.1e over %d entries\n", mode ? "bidir" : "causal", K, dc, worst, checked);
     g_noquant = 0;
 }
 
 // changing token p may only move logits inside the receptive field [p - L*right, p + L*left]
-static void test_receptive_field(int mode, int K) {
-    Config c = {.vocab = 11, .d = 32, .n_layers = 4, .T = 64, .K = K, .mode = mode, .seed = 9};
+static void test_receptive_field(int mode, int K, int dc) {
+    Config c = {.vocab = 11, .d = 32, .n_layers = 4, .T = 64, .K = K, .mode = mode, .dil_cycle = dc, .seed = 9};
     const int N = c.T, p = 30; Model m; model_init(&m, &c, N);
     int tok[64]; Rng r = rng_seed(5);
     for (int n = 0; n < N; n++) tok[n] = rng_u64(&r) % 11;
     float *a = xmalloc(4 * N * 11); model_logits(&m, tok, N); memcpy(a, m.logits, 4 * N * 11);
     tok[p] = (tok[p] + 1) % 11; model_logits(&m, tok, N);
-    const int back = mode == MODE_CAUSAL ? 0 : c.n_layers * (K / 2), fwd = mode == MODE_CAUSAL ? c.n_layers * (K - 1) : c.n_layers * (K / 2);
+    int sd = 0; for (int l = 0; l < c.n_layers; l++) sd += model_dil(dc, l);
+    const int back = mode == MODE_CAUSAL ? 0 : sd * (K / 2), fwd = mode == MODE_CAUSAL ? sd * (K - 1) : sd * (K / 2);
     double outside = 0, inside = 0;
     for (int n = 0; n < N; n++) for (int v = 0; v < 11; v++) {
         const double dl = fabs(a[n * 11 + v] - m.logits[n * 11 + v]);
         if (n < p - back || n > p + fwd) outside = fmax(outside, dl); else inside = fmax(inside, dl);
     }
     CHECK(outside == 0 && inside > 0, "receptive field mode=%d: outside %g inside %g", mode, outside, inside);
-    printf("receptive field %-6s K=%d    : edit at t=%d moves logits only in [%d, %d] (outside %g, inside %.3f)\n",
-           mode ? "bidir" : "causal", K, p, p - back, p + fwd, outside, inside);
+    printf("receptive field %-6s K=%d dil=%d: edit at t=%d moves logits only in [%d, %d] (outside %g, inside %.3f)\n",
+           mode ? "bidir" : "causal", K, dc, p, p - back, p + fwd, outside, inside);
 }
 
-static void test_stream(int K) {
-    Config c = {.vocab = 11, .d = 32, .n_layers = 4, .T = 64, .K = K, .mode = MODE_CAUSAL, .seed = 3};
+static void test_stream(int K, int dc) {
+    Config c = {.vocab = 11, .d = 32, .n_layers = 4, .T = 64, .K = K, .mode = MODE_CAUSAL, .dil_cycle = dc, .seed = 3};
     const int T = c.T, S = 3; Model m; model_init(&m, &c, S * T);
     Rng r = rng_seed(6);
     for (int l = 0; l < c.n_layers; l++) for (size_t i = 0; i < m.blk[l].cw.n; i++) m.blk[l].cw.w[i] += 0.3f * rng_normal(&r);
@@ -140,7 +141,7 @@ static void test_stream(int K) {
         for (int i = 0; i < S; i++) for (int v = 0; v < 11; v++) err = fmax(err, fabs(m.logits[i * 11 + v] - ref[(i * T + t) * 11 + v]));
     }
     CHECK(err < 1e-4, "stream vs batch K=%d err %g", K, err);
-    printf("streaming decode K=%d         : %d streams x %d steps == batch forward (max |logit diff| %.1e)\n", K, S, T, err);
+    printf("streaming decode K=%d dil=%d   : %d streams x %d steps == batch forward (max |logit diff| %.1e)\n", K, dc, S, T, err);
 }
 
 static void test_data_parallel(void) {
@@ -164,10 +165,11 @@ static void test_data_parallel(void) {
 int main(void) {
     printf("threads: %d\n", omp_get_max_threads());
     test_gemm(); test_bitlinear(); test_bf16_backward(); test_amx();
-    for (int mode = 0; mode < 2; mode++) for (int K = 3; K <= 5; K += 2) test_gradients(mode, K);
-    for (int mode = 0; mode < 2; mode++) test_receptive_field(mode, 3);
-    test_receptive_field(MODE_CAUSAL, 4);
-    test_stream(3); test_stream(4);
+    for (int mode = 0; mode < 2; mode++) for (int K = 3; K <= 5; K += 2) test_gradients(mode, K, 0);
+    for (int mode = 0; mode < 2; mode++) test_gradients(mode, 3, 3);
+    for (int mode = 0; mode < 2; mode++) { test_receptive_field(mode, 3, 0); test_receptive_field(mode, 3, 3); }
+    test_receptive_field(MODE_CAUSAL, 4, 0);
+    test_stream(3, 0); test_stream(4, 0); test_stream(3, 3); test_stream(4, 4);
     test_data_parallel();
     printf(fails ? "\n%d FAILURES\n" : "\nall tests passed\n", fails);
     return fails != 0;

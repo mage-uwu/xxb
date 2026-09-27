@@ -3,10 +3,10 @@
 /* Gated short-conv block:  [u | g] = BitLinear_in(x);  us[t] = sum_j cw[j] u[t + off(j)];  y = BitLinear_out(us * g)
    Taps that fall outside the current sequence of T tokens read zeros. Layout [token][channel]; loops over channels. */
 
-void blk_init(Block *b, int d, int T, int K, int mode, int cap, Rng *rng) {
+void blk_init(Block *b, int d, int T, int K, int mode, int dil, int cap, Rng *rng) {
     if (d % 16) { fprintf(stderr, "block: d must be a multiple of 16\n"); exit(1); }
     if (mode == MODE_BIDIR && !(K & 1)) { fprintf(stderr, "block: bidirectional mode needs an odd K\n"); exit(1); }
-    b->d = d; b->T = T; b->K = K; b->mode = mode; b->cap = cap;
+    b->d = d; b->T = T; b->K = K; b->mode = mode; b->cap = cap; b->dil = dil;
     bl_init(&b->inp, d, 2 * d, cap, rng); bl_init(&b->out, d, d, cap, rng);
     param_init(&b->cw, (size_t)K * d, 1.0f);
     for (int j = 0; j < K; j++)                                           // identity-ish init: centre / current tap
@@ -25,7 +25,7 @@ static void conv_gate_fwd(Block *b, int N) {
         for (int c = 0; c < d; c += 16) {
             __m512 a = _mm512_setzero_ps();
             for (int j = 0; j < K; j++) {
-                const int o = tap_off(b->mode, K, j);
+                const int o = blk_off(b, j);
                 if (t + o < 0 || t + o >= T) continue;
                 a = _mm512_fmadd_ps(_mm512_loadu_ps(cw + j * d + c), _mm512_loadu_ps(b->ug + (size_t)(n + o) * d2 + c), a);
             }
@@ -65,7 +65,7 @@ static void conv_gate_bwd(Block *b, int N) {
                 __m512 a = _mm512_setzero_ps();
                 const __m512 g = _mm512_loadu_ps(dus + n * d + c);
                 for (int j = 0; j < K; j++) {
-                    const int o = tap_off(b->mode, K, j);
+                    const int o = blk_off(b, j);
                     if (t - o >= 0 && t - o < T) a = _mm512_fmadd_ps(_mm512_loadu_ps(cw + j * d + c), _mm512_loadu_ps(dus + (n - o) * d + c), a);
                     if (t + o >= 0 && t + o < T) {
                         float *p = tg + j * d + c;

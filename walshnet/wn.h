@@ -88,13 +88,15 @@ void bl_backward(BitLinear *l, const float *dy, float *dx);  // accumulates W.g;
 /* ------------------------------------------------------------------ gated short-conv block */
 enum { MODE_CAUSAL = 0, MODE_BIDIR = 1 };
 typedef struct {
-    int d, T, K, mode, cap;
+    int d, T, K, mode, cap, dil;                 // dil: tap spacing (dilation) of this layer's conv
     BitLinear inp, out;                          // d -> 2d (u | g), d -> d
     Param cw;                                    // depthwise conv taps [K][d]; tap j reads position t + off(j)
     float *ug, *us, *z, *dz, *dug;               // caches [cap][2d] / [cap][d]
 } Block;
+static inline int model_dil(int dil_cycle, int l) { return dil_cycle ? 1 << (l % dil_cycle) : 1; }
 static inline int tap_off(int mode, int K, int j) { return mode == MODE_CAUSAL ? -j : j - K / 2; }
-void blk_init(Block *b, int d, int T, int K, int mode, int cap, Rng *rng);
+static inline int blk_off(const Block *b, int j) { return tap_off(b->mode, b->K, j) * b->dil; }
+void blk_init(Block *b, int d, int T, int K, int mode, int dil, int cap, Rng *rng);
 void blk_prepare(Block *b);
 void blk_forward(Block *b, const float *x, int N, float *y);
 void blk_backward(Block *b, const float *dy, float *dx);
@@ -102,6 +104,7 @@ void blk_backward(Block *b, const float *dy, float *dx);
 /* ------------------------------------------------------------------ model */
 typedef struct {
     int vocab, d, n_layers, T, K, mode;          // bidir adds a [MASK] token to the embedding table
+    int dil_cycle;                               // layer l dilation = 2^(l mod dil_cycle); 0 = no dilation
     uint64_t seed;
 } Config;
 
@@ -136,7 +139,8 @@ int model_load(Model *m, const char *path, unsigned char *vocab_chars, int cap);
 // O(layers * d^2) regardless of how long the stream has been running. Runs S independent streams in lock-step.
 typedef struct {
     Model *m; int S, pos;
-    float *x, *y, *ug, *z, *hist;                // hist: [layers][K-1][S][d] past u values (ring, newest first)
+    float *x, *y, *ug, *z, *hist;                // hist: per layer a ring of (K-1)*dil past u values, [slot][S][d]
+    size_t *hoff; int *hlen;                     // per-layer ring offset (floats) and length (slots)
 } Stream;
 void stream_init(Stream *s, Model *m, int S);    // requires m->cap >= S and a causal model
 void stream_reset(Stream *s);
