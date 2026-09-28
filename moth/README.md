@@ -44,6 +44,18 @@ Speed on 4 cores (AVX-512), per training step at the default size (0.31M params,
 
 The loss curves match (val 2.17 at step 500 for both). The int16 change is bit-identical.
 
+## Result
+
+The full default run takes 3000 steps at about 105 ms/step, around 5.5 minutes on 4 cores. It reaches **val loss 1.97** (train 1.75) on Tiny Shakespeare:
+
+```
+LEONTES:
+If the deadset on father with and ray thou to not
+That sham is namping and my more,
+Whild de wer charl I am your come, made with a on my
+soody o's parsh in he nou a grough hen and forse!
+```
+
 ## Run
 
 ```sh
